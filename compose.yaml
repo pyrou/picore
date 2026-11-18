@@ -1,0 +1,10 @@
+services:
+  picore:
+    build: .
+    ports:
+      - "3000:3000"
+    volumes:
+      - cache:/data
+    restart: unless-stopped
+volumes:
+  cache:

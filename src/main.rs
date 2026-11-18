@@ -2,7 +2,7 @@ use axum::{
     Json, Router,
     extract::{Query, State},
     http::StatusCode,
-    response::{Html, IntoResponse},
+    response::Html,
     routing::get,
 };
 use regex::Regex;
@@ -160,7 +160,7 @@ async fn artwork(app: &App, input: &str) -> Result<Artwork, ApiError> {
         a.is_cached = true;
         return Ok(a);
     }
-    let page = fetch(app, &format!("https://music.apple.com/{store}/{kind}/{id}")).await?;
+    let page = fetch(app, "https://music.apple.com/us/new").await?;
     let assets = Regex::new(r#"/assets/[^\"']+\.js"#).unwrap();
     let jwt = Regex::new(r#"eyJ[A-Za-z0-9_=-]+\.[A-Za-z0-9_=-]+\.[A-Za-z0-9_=-]+"#).unwrap();
     let mut token = None;
