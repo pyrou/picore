@@ -176,11 +176,11 @@ async fn artwork(app: &App, input: &str) -> Result<Artwork, ApiError> {
         .filter(|p| p.contains("index") || p.contains("web-client") || p.contains("apple-music"))
         .take(10)
     {
-        if let Ok(js) = fetch(app, &format!("https://music.apple.com{asset}")).await {
-            if let Some(m) = jwt.find(&js) {
-                token = Some(m.as_str().to_owned());
-                break;
-            }
+        if let Ok(js) = fetch(app, &format!("https://music.apple.com{asset}")).await
+            && let Some(m) = jwt.find(&js)
+        {
+            token = Some(m.as_str().to_owned());
+            break;
         }
     }
     let token = token.ok_or_else(|| {

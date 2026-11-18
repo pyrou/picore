@@ -87,8 +87,8 @@
     function play(url) {
       const video = document.querySelector('#video');
       if (hls) { hls.destroy(); hls = null; }
-      if (video.canPlayType('application/vnd.apple.mpegurl')) video.src = url;
-      else if (window.Hls && Hls.isSupported()) { hls = new Hls(); hls.loadSource(url); hls.attachMedia(video); }
+      if (window.Hls && Hls.isSupported()) { hls = new Hls(); hls.loadSource(url); hls.attachMedia(video); }
+      else if (video.canPlayType('application/vnd.apple.mpegurl')) video.src = url;
       else message.textContent = 'HLS playback is not supported by this browser.';
     }
     async function loadHistory() {
