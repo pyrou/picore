@@ -1,8 +1,8 @@
 use axum::{
     Json, Router,
     extract::{Query, State},
-    http::StatusCode,
-    response::Html,
+    http::{StatusCode, header},
+    response::{Html, Response},
     routing::get,
 };
 use regex::Regex;
@@ -14,7 +14,7 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tokio::sync::Semaphore;
+use tokio::{io::AsyncReadExt, process::Command, sync::Semaphore};
 use url::Url;
 
 #[derive(Clone)]
@@ -22,6 +22,7 @@ struct App {
     db: Arc<Mutex<Connection>>,
     client: reqwest::Client,
     upstream: Arc<Semaphore>,
+    conversions: Arc<Semaphore>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Artwork {
@@ -35,6 +36,11 @@ struct Artwork {
 #[derive(Deserialize)]
 struct UrlQuery {
     url: String,
+}
+#[derive(Deserialize)]
+struct DownloadQuery {
+    url: String,
+    format: String,
 }
 #[derive(Deserialize)]
 struct SearchQuery {
@@ -267,6 +273,130 @@ async fn search(
     cache_put(&app, &key, &a)?;
     result(a)
 }
+
+async fn download(
+    State(app): State<App>,
+    Query(q): Query<DownloadQuery>,
+) -> Result<Response, ApiError> {
+    let (mime, extension) = match q.format.as_str() {
+        "mp4" => ("video/mp4", "mp4"),
+        "webp" => ("image/webp", "webp"),
+        _ => return Err(err(StatusCode::BAD_REQUEST, "Format must be mp4 or webp")),
+    };
+    let trusted = Url::parse(&q.url).ok().is_some_and(|u| {
+        u.scheme() == "https"
+            && u.host_str() == Some("mvod.itunes.apple.com")
+            && u.port().is_none()
+            && u.username().is_empty()
+            && u.password().is_none()
+    });
+    if !trusted {
+        return Err(err(StatusCode::BAD_REQUEST, "Invalid Apple artwork stream"));
+    }
+    let known = {
+        let db = app
+            .db
+            .lock()
+            .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Cache unavailable"))?;
+        let mut stmt = db
+            .prepare(
+                "SELECT value FROM cache WHERE expires > unixepoch() AND key NOT LIKE 'search:%'",
+            )
+            .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Cache read failed"))?;
+        let values = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Cache read failed"))?;
+        values
+            .filter_map(|row| {
+                row.ok()
+                    .and_then(|v| serde_json::from_str::<Artwork>(&v).ok())
+            })
+            .any(|a| a.url.as_deref() == Some(&q.url) || a.url_tall.as_deref() == Some(&q.url))
+    };
+    if !known {
+        return Err(err(
+            StatusCode::NOT_FOUND,
+            "Look up this artwork before downloading it",
+        ));
+    }
+    let _permit = app.conversions.try_acquire().map_err(|_| {
+        err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Too many conversions; try again shortly",
+        )
+    })?;
+    let mut command = Command::new("ffmpeg");
+    command.args([
+        "-v",
+        "error",
+        "-nostdin",
+        "-protocol_whitelist",
+        "https,tls,tcp,crypto",
+        "-i",
+        &q.url,
+        "-t",
+        "60",
+        "-map",
+        "0:v:0",
+        "-an",
+    ]);
+    if extension == "mp4" {
+        command.args([
+            "-c:v",
+            "copy",
+            "-movflags",
+            "frag_keyframe+empty_moov",
+            "-f",
+            "mp4",
+        ]);
+    } else {
+        command.args([
+            "-c:v", "libwebp", "-loop", "0", "-quality", "80", "-f", "webp",
+        ]);
+    }
+    command
+        .arg("pipe:1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let mut child = command
+        .spawn()
+        .map_err(|_| err(StatusCode::SERVICE_UNAVAILABLE, "FFmpeg is not available"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "Conversion failed"))?;
+    let conversion = async {
+        let mut bytes = Vec::new();
+        stdout
+            .take(64 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|_| ())?;
+        if bytes.len() > 64 * 1024 * 1024 {
+            return Err(());
+        }
+        let status = child.wait().await.map_err(|_| ())?;
+        if !status.success() || bytes.is_empty() {
+            return Err(());
+        }
+        Ok(bytes)
+    };
+    let bytes = tokio::time::timeout(Duration::from_secs(120), conversion)
+        .await
+        .map_err(|_| err(StatusCode::GATEWAY_TIMEOUT, "Conversion timed out"))?
+        .map_err(|_| err(StatusCode::BAD_GATEWAY, "Could not convert artwork"))?;
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, mime)
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=artwork.{extension}"),
+        )
+        .body(bytes.into())
+        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Conversion failed"))
+}
+
 async fn history(State(app): State<App>) -> Result<Json<Vec<Artwork>>, ApiError> {
     let db = app
         .db
@@ -291,6 +421,7 @@ async fn main() {
         db: Arc::new(Mutex::new(db)),
         client,
         upstream: Arc::new(Semaphore::new(2)),
+        conversions: Arc::new(Semaphore::new(2)),
     };
     let router = Router::new()
         .route(
@@ -300,6 +431,7 @@ async fn main() {
         .route("/api/v1/artwork/url", get(by_url))
         .route("/api/v1/artwork/search", get(search))
         .route("/api/v1/artwork/history", get(history))
+        .route("/api/v1/artwork/download", get(download))
         .route(
             "/api/v1/status",
             get(|| async { Json(json!({"status":"operational"})) }),
