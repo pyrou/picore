@@ -241,34 +241,153 @@ async fn by_url(
 ) -> Result<Json<Artwork>, ApiError> {
     result(artwork(&app, &q.url).await?)
 }
+fn normalized_name(input: &str) -> String {
+    input
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn album_score(found: &str, requested: &str) -> u8 {
+    let found = normalized_name(found);
+    let requested = normalized_name(requested);
+    if found.is_empty() || requested.is_empty() {
+        return 0;
+    }
+    if found == requested {
+        return 2;
+    }
+    let edition = |extra: &str| {
+        let words = [
+            "deluxe",
+            "edition",
+            "version",
+            "remastered",
+            "remaster",
+            "anniversary",
+            "expanded",
+            "bonus",
+            "track",
+            "tracks",
+            "explicit",
+            "clean",
+            "special",
+        ];
+        extra
+            .split_whitespace()
+            .all(|w| words.contains(&w) || w.chars().all(|c| c.is_ascii_digit()))
+    };
+    if found
+        .strip_prefix(&format!("{requested} "))
+        .is_some_and(edition)
+        || requested
+            .strip_prefix(&format!("{found} "))
+            .is_some_and(edition)
+    {
+        1
+    } else {
+        0
+    }
+}
+
+fn find_album<'a>(data: &'a Value, artist: &str, album: &str) -> Option<&'a str> {
+    let artist = normalized_name(artist);
+    data.get("results")?
+        .as_array()?
+        .iter()
+        .filter_map(|item| {
+            let found_artist = normalized_name(item.get("artistName")?.as_str()?);
+            if artist.is_empty() || found_artist != artist {
+                return None;
+            }
+            let score = album_score(item.get("collectionName")?.as_str()?, album);
+            if score == 0 {
+                return None;
+            }
+            let url = item.get("collectionViewUrl")?.as_str()?;
+            target(url)?;
+            Some((score, url))
+        })
+        .max_by_key(|(score, _)| *score)
+        .map(|(_, url)| url)
+}
+
 async fn search(
     State(app): State<App>,
     Query(q): Query<SearchQuery>,
 ) -> Result<Json<Artwork>, ApiError> {
-    if q.artist.trim().is_empty() || q.album.trim().is_empty() {
+    if q.artist.trim().is_empty()
+        || q.album.trim().is_empty()
+        || q.artist.len() > 300
+        || q.album.len() > 300
+        || q.title.as_ref().is_some_and(|v| v.len() > 300)
+    {
         return Err(err(
             StatusCode::BAD_REQUEST,
-            "Artist and album are required",
+            "Artist and album are required and must be at most 300 bytes",
         ));
     }
-    let term = format!("{} {} {}", q.artist, q.album, q.title.unwrap_or_default());
-    let mut u = Url::parse("https://itunes.apple.com/search").unwrap();
-    u.query_pairs_mut()
-        .append_pair("term", &term)
-        .append_pair("entity", "album")
-        .append_pair("limit", "5");
-    let key = format!("search:{}", term.trim().to_lowercase());
+    let title = q.title.unwrap_or_default();
+    let term = format!("{} {} {}", q.artist, q.album, title);
+    let key = format!(
+        "search:{}",
+        serde_json::to_string(&(
+            normalized_name(&q.artist),
+            normalized_name(&q.album),
+            normalized_name(&title)
+        ))
+        .unwrap()
+    );
     if let Some(mut a) = cache_get(&app, &key)? {
         a.is_cached = true;
         return result(a);
     }
+    {
+        let db = app
+            .db
+            .lock()
+            .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Cache unavailable"))?;
+        let absent: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM negative_search WHERE key=?1 AND expires > unixepoch())", [&key], |row| row.get(0))
+            .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Cache read failed"))?;
+        if absent {
+            return Err(err(StatusCode::NOT_FOUND, "No album found"));
+        }
+    }
+    let mut u = Url::parse("https://itunes.apple.com/search").unwrap();
+    u.query_pairs_mut()
+        .append_pair("term", &term)
+        .append_pair(
+            "entity",
+            if title.trim().is_empty() {
+                "album"
+            } else {
+                "song"
+            },
+        )
+        .append_pair("limit", "50");
     let body = fetch(&app, u.as_str()).await?;
     let data: Value = serde_json::from_str(&body)
         .map_err(|_| err(StatusCode::BAD_GATEWAY, "Invalid search response"))?;
-    let link = data
-        .pointer("/results/0/collectionViewUrl")
-        .and_then(Value::as_str)
-        .ok_or_else(|| err(StatusCode::NOT_FOUND, "No album found"))?;
+    // Only an explicit results array is a confirmed miss. Upstream errors must never be cached as misses.
+    if !data.get("results").is_some_and(Value::is_array) {
+        return Err(err(StatusCode::BAD_GATEWAY, "Invalid search response"));
+    }
+    let Some(link) = find_album(&data, &q.artist, &q.album) else {
+        let db = app
+            .db
+            .lock()
+            .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Cache unavailable"))?;
+        db.execute(
+            "INSERT OR REPLACE INTO negative_search(key,expires) VALUES (?1,unixepoch()+86400)",
+            [&key],
+        )
+        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Cache write failed"))?;
+        return Err(err(StatusCode::NOT_FOUND, "No album found"));
+    };
     let a = artwork(&app, link).await?;
     cache_put(&app, &key, &a)?;
     result(a)
@@ -415,7 +534,7 @@ async fn history(State(app): State<App>) -> Result<Json<Vec<Artwork>>, ApiError>
 async fn main() {
     let path = env::var("DATABASE_PATH").unwrap_or_else(|_| "cache.db".into());
     let db = Connection::open(path).expect("open cache database");
-    db.execute_batch("CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, value TEXT NOT NULL, expires INTEGER NOT NULL, updated INTEGER NOT NULL);").expect("initialize cache");
+    db.execute_batch("CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, value TEXT NOT NULL, expires INTEGER NOT NULL, updated INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS negative_search (key TEXT PRIMARY KEY, expires INTEGER NOT NULL);").expect("initialize cache");
     let client = reqwest::Client::builder().timeout(Duration::from_secs(15)).redirect(reqwest::redirect::Policy::none()).user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Version/17.0 Safari/605.1.15").build().unwrap();
     let app = App {
         db: Arc::new(Mutex::new(db)),
@@ -462,5 +581,25 @@ mod tests {
         ] {
             assert!(target(u).is_none());
         }
+    }
+    #[test]
+    fn search_requires_artist_and_album_match_and_prefers_exact() {
+        let data = json!({"results": [
+            {"artistName":"Other", "collectionName":"Living Things", "collectionViewUrl":"https://music.apple.com/us/album/1"},
+            {"artistName":"Linkin Park", "collectionName":"Living Things (Deluxe Edition)", "collectionViewUrl":"https://music.apple.com/us/album/2"},
+            {"artistName":"LINKIN PARK", "collectionName":"LIVING THINGS", "collectionViewUrl":"https://music.apple.com/us/album/3"},
+            {"artistName":"Linkin Park", "collectionName":"Living Things Live", "collectionViewUrl":"https://music.apple.com/us/album/4"}
+        ]});
+        assert_eq!(
+            find_album(&data, "Linkin Park", "Living Things"),
+            Some("https://music.apple.com/us/album/3")
+        );
+        assert_eq!(find_album(&data, "Linkin Park", "Living"), None);
+        assert_eq!(find_album(&data, "Nobody", "Living Things"), None);
+        assert_eq!(
+            album_score("Living Things (Deluxe Edition)", "Living Things"),
+            1
+        );
+        assert_eq!(album_score("Living Things Live", "Living Things"), 0);
     }
 }
