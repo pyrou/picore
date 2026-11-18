@@ -602,4 +602,37 @@ mod tests {
         );
         assert_eq!(album_score("Living Things Live", "Living Things"), 0);
     }
+    #[test]
+    fn cache_stores_and_expires_positive_and_negative_artwork() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE cache (key TEXT PRIMARY KEY, value TEXT NOT NULL, expires INTEGER NOT NULL, updated INTEGER NOT NULL)").unwrap();
+        let app = App {
+            db: Arc::new(Mutex::new(db)),
+            client: reqwest::Client::new(),
+            upstream: Arc::new(Semaphore::new(2)),
+            conversions: Arc::new(Semaphore::new(2)),
+        };
+        let mut art = Artwork {
+            url: Some("https://example.com/test.m3u8".into()),
+            url_tall: None,
+            artist: "Artist".into(),
+            album: "Album".into(),
+            is_cached: false,
+        };
+        cache_put(&app, "positive", &art).unwrap();
+        art.url = None;
+        cache_put(&app, "negative", &art).unwrap();
+        assert!(cache_get(&app, "positive").unwrap().unwrap().url.is_some());
+        assert!(cache_get(&app, "negative").unwrap().unwrap().url.is_none());
+        app.db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE cache SET expires=unixepoch()-1 WHERE key='negative'",
+                [],
+            )
+            .unwrap();
+        assert!(cache_get(&app, "negative").unwrap().is_none());
+        assert!(cache_get(&app, "positive").unwrap().is_some());
+    }
 }
