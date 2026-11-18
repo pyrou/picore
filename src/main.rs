@@ -276,6 +276,8 @@ fn album_score(found: &str, requested: &str) -> u8 {
             "explicit",
             "clean",
             "special",
+            "single",
+            "ep",
         ];
         extra
             .split_whitespace()
@@ -346,12 +348,14 @@ async fn search(
         a.is_cached = true;
         return result(a);
     }
+    // Version negative entries when matching rules change so older misses are retried.
+    let negative_key = format!("v2:{key}");
     {
         let db = app
             .db
             .lock()
             .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Cache unavailable"))?;
-        let absent: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM negative_search WHERE key=?1 AND expires > unixepoch())", [&key], |row| row.get(0))
+        let absent: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM negative_search WHERE key=?1 AND expires > unixepoch())", [&negative_key], |row| row.get(0))
             .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Cache read failed"))?;
         if absent {
             return Err(err(StatusCode::NOT_FOUND, "No album found"));
@@ -383,7 +387,7 @@ async fn search(
             .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Cache unavailable"))?;
         db.execute(
             "INSERT OR REPLACE INTO negative_search(key,expires) VALUES (?1,unixepoch()+86400)",
-            [&key],
+            [&negative_key],
         )
         .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Cache write failed"))?;
         return Err(err(StatusCode::NOT_FOUND, "No album found"));
@@ -601,6 +605,21 @@ mod tests {
             1
         );
         assert_eq!(album_score("Living Things Live", "Living Things"), 0);
+    }
+    #[test]
+    fn search_matches_single_and_ep_without_accepting_unrelated_titles() {
+        let data = json!({"results": [
+            {"artistName":"BLACKPINK", "collectionName":"JUMP (Remix) - Single", "collectionViewUrl":"https://music.apple.com/us/album/1"},
+            {"artistName":"BLACKPINK", "collectionName":"JUMP - Single", "collectionViewUrl":"https://music.apple.com/us/album/2"}
+        ]});
+        assert_eq!(
+            find_album(&data, "BLACKPINK", "JUMP"),
+            Some("https://music.apple.com/us/album/2")
+        );
+        assert_eq!(album_score("JUMP - Single", "JUMP"), 1);
+        assert_eq!(album_score("JUMP", "JUMP - Single"), 1);
+        assert_eq!(album_score("SQUARE TWO - EP", "SQUARE TWO"), 1);
+        assert_eq!(album_score("JUMP (Remix) - Single", "JUMP"), 0);
     }
     #[test]
     fn cache_stores_and_expires_positive_and_negative_artwork() {
