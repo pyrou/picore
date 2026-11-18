@@ -1,1 +1,113 @@
-<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Picore — Animated artwork</title><style>body{font:16px system-ui;background:#101116;color:#eee;max-width:760px;margin:4rem auto;padding:0 1.2rem}h1{font-size:2.5rem}p{color:#aaa}form{display:grid;gap:.7rem;margin:2rem 0;padding:1.2rem;background:#1c1e27;border-radius:1rem}input,button{font:inherit;padding:.8rem;border:0;border-radius:.5rem}input{background:#30323d;color:white}button{background:#f34465;color:white;cursor:pointer;font-weight:600}video{width:100%;max-height:65vh;border-radius:1rem;background:#000}a{color:#ff8299}#result{display:none}.links{display:flex;flex-wrap:wrap;align-items:center;gap:1rem;margin:1rem 0}button:disabled{opacity:.5}</style><h1>Animated artwork</h1><p>Find animated album and playlist artwork on Apple Music.</p><form id="urlForm"><input name="url" type="url" placeholder="Apple Music album or playlist URL" required><button>Find artwork</button></form><form id="searchForm"><input name="artist" placeholder="Artist" required><input name="album" placeholder="Album" required><button>Search</button></form><p id="message"></p><section id="result"><h2 id="name"></h2><div class="links" id="links"></div><video id="video" controls autoplay muted loop playsinline></video></section><script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script><script>let hls; async function submit(e,path){e.preventDefault();document.querySelector('#message').textContent='Searching…';document.querySelector('#result').style.display='none';try{let r=await fetch(path+'?'+new URLSearchParams(new FormData(e.target)));let d=await r.json();if(!r.ok)throw Error(d.message||'Search failed');document.querySelector('#message').textContent=d.isCached?'Loaded from cache':'';document.querySelector('#name').textContent=d.artist+' — '+d.album;let links=document.querySelector('#links');links.replaceChildren();for(const [label,url] of [['Square',d.url],['Tall',d.url_tall]])if(url){let a=document.createElement('a');a.href=url;a.textContent=label+' stream';a.target='_blank';a.rel='noopener noreferrer';links.append(a);let b=document.createElement('button');b.textContent='Play '+label.toLowerCase();b.onclick=()=>play(url);links.append(b);for(const format of ['mp4','webp']){let download=document.createElement('button');download.textContent='Download '+label+' '+format.toUpperCase();download.onclick=()=>downloadArtwork(url,format,download);links.append(download)}}document.querySelector('#result').style.display='block';play(d.url||d.url_tall)}catch(error){document.querySelector('#message').textContent=error.message}}async function downloadArtwork(url,format,button){button.disabled=true;let label=button.textContent;button.textContent='Converting…';try{let response=await fetch('/api/v1/artwork/download?'+new URLSearchParams({url,format}));if(!response.ok){let data=await response.json();throw Error(data.message||'Download failed')}let blob=await response.blob(), objectUrl=URL.createObjectURL(blob), link=document.createElement('a');link.href=objectUrl;link.download='artwork.'+format;link.click();setTimeout(()=>URL.revokeObjectURL(objectUrl),1000)}catch(error){document.querySelector('#message').textContent=error.message}finally{button.disabled=false;button.textContent=label}}function play(url){let video=document.querySelector('#video');if(hls)hls.destroy();if(video.canPlayType('application/vnd.apple.mpegurl'))video.src=url;else if(window.Hls&&Hls.isSupported()){hls=new Hls();hls.loadSource(url);hls.attachMedia(video)}else document.querySelector('#message').textContent='HLS playback is not supported by this browser.'}document.querySelector('#urlForm').onsubmit=e=>submit(e,'/api/v1/artwork/url');document.querySelector('#searchForm').onsubmit=e=>submit(e,'/api/v1/artwork/search');</script></html>
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Picore — Animated artwork</title>
+  <style>
+    body { font: 16px system-ui; background: #101116; color: #eee; max-width: 760px; margin: 4rem auto; padding: 0 1.2rem; }
+    h1 { font-size: 2.5rem; } p { color: #aaa; }
+    form { display: grid; gap: .7rem; margin: 2rem 0; padding: 1.2rem; background: #1c1e27; border-radius: 1rem; }
+    input, button { font: inherit; padding: .8rem; border: 0; border-radius: .5rem; }
+    input { background: #30323d; color: white; } button { background: #f34465; color: white; cursor: pointer; font-weight: 600; }
+    button:disabled { opacity: .5; cursor: wait; } video { width: 100%; max-height: 65vh; border-radius: 1rem; background: #000; }
+    a { color: #ff8299; } .links, #history { display: flex; flex-wrap: wrap; align-items: center; gap: .6rem; margin: 1rem 0; }
+    .variant { display: flex; flex-wrap: wrap; align-items: center; gap: .6rem; width: 100%; }
+    #history button { background: #30323d; text-align: left; }
+  </style>
+</head>
+<body>
+  <h1>Animated artwork</h1>
+  <p>Find animated album and playlist artwork on Apple Music.</p>
+  <form id="urlForm" aria-label="Find artwork by URL">
+    <input name="url" type="url" placeholder="Apple Music album or playlist URL" aria-label="Apple Music URL" required>
+    <button>Find artwork</button>
+  </form>
+  <form id="searchForm" aria-label="Find artwork by artist and album">
+    <input name="artist" placeholder="Artist" aria-label="Artist" required>
+    <input name="album" placeholder="Album" aria-label="Album" required>
+    <button>Search</button>
+  </form>
+  <p id="message" role="status" aria-live="polite"></p>
+  <section id="result" hidden>
+    <h2 id="name"></h2>
+    <div class="links" id="links"></div>
+    <video id="video" controls autoplay muted loop playsinline></video>
+  </section>
+  <section><h2>Recent artwork</h2><div id="history"></div></section>
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
+  <script>
+    const message = document.querySelector('#message');
+    let hls;
+    async function submit(event, path) {
+      event.preventDefault();
+      message.textContent = 'Searching…';
+      document.querySelector('#result').hidden = true;
+      try {
+        const response = await fetch(path + '?' + new URLSearchParams(new FormData(event.target)));
+        const data = await response.json();
+        if (!response.ok) throw Error(data.message || 'Search failed');
+        showArtwork(data);
+        await loadHistory();
+      } catch (error) { message.textContent = error.message; }
+    }
+    function showArtwork(data) {
+      message.textContent = data.isCached ? 'Loaded from cache' : '';
+      document.querySelector('#name').textContent = data.artist + ' — ' + data.album;
+      const links = document.querySelector('#links');
+      links.replaceChildren();
+      for (const [label, url] of [['Square', data.url], ['Tall', data.url_tall]]) {
+        if (!url) continue;
+        const row = document.createElement('div'); row.className = 'variant';
+        const stream = document.createElement('a'); stream.href = url; stream.textContent = label + ' stream';
+        stream.target = '_blank'; stream.rel = 'noopener noreferrer'; row.append(stream);
+        const playButton = document.createElement('button'); playButton.textContent = 'Play ' + label.toLowerCase();
+        playButton.onclick = () => play(url); row.append(playButton);
+        for (const format of ['mp4', 'webp']) {
+          const button = document.createElement('button'); button.textContent = 'Download ' + format.toUpperCase();
+          button.onclick = () => downloadArtwork(url, format, button); row.append(button);
+        }
+        links.append(row);
+      }
+      document.querySelector('#result').hidden = false;
+      play(data.url || data.url_tall);
+    }
+    async function downloadArtwork(url, format, button) {
+      button.disabled = true;
+      const label = button.textContent; button.textContent = 'Converting…';
+      try {
+        const response = await fetch('/api/v1/artwork/download?' + new URLSearchParams({url, format}));
+        if (!response.ok) { const data = await response.json(); throw Error(data.message || 'Download failed'); }
+        const objectUrl = URL.createObjectURL(await response.blob());
+        const link = document.createElement('a'); link.href = objectUrl; link.download = 'artwork.' + format; link.click();
+        setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+      } catch (error) { message.textContent = error.message; }
+      finally { button.disabled = false; button.textContent = label; }
+    }
+    function play(url) {
+      const video = document.querySelector('#video');
+      if (hls) { hls.destroy(); hls = null; }
+      if (video.canPlayType('application/vnd.apple.mpegurl')) video.src = url;
+      else if (window.Hls && Hls.isSupported()) { hls = new Hls(); hls.loadSource(url); hls.attachMedia(video); }
+      else message.textContent = 'HLS playback is not supported by this browser.';
+    }
+    async function loadHistory() {
+      try {
+        const response = await fetch('/api/v1/artwork/history');
+        if (!response.ok) return;
+        const history = document.querySelector('#history'); history.replaceChildren();
+        for (const item of await response.json()) {
+          if (!item.url && !item.url_tall) continue;
+          const button = document.createElement('button'); button.textContent = item.artist + ' — ' + item.album;
+          button.onclick = () => { showArtwork(item); document.querySelector('#result').scrollIntoView({behavior: 'smooth'}); };
+          history.append(button);
+        }
+        if (!history.childElementCount) history.textContent = 'No recent artwork yet.';
+      } catch { document.querySelector('#history').textContent = 'History is unavailable.'; }
+    }
+    document.querySelector('#urlForm').onsubmit = event => submit(event, '/api/v1/artwork/url');
+    document.querySelector('#searchForm').onsubmit = event => submit(event, '/api/v1/artwork/search');
+    loadHistory();
+  </script>
+</body>
+</html>

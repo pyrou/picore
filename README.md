@@ -8,7 +8,7 @@ Find and play Apple Music animated album and playlist artwork. No user account i
 docker compose up -d --build
 ```
 
-Open http://localhost:3000. The SQLite cache is persisted in a Docker volume. Alternatively, run `cargo run --release` with Rust 1.96 or newer and FFmpeg installed on the server. Set `BIND_ADDRESS` (default `0.0.0.0:3000`) and `DATABASE_PATH` (default `cache.db`) as needed.
+Open http://localhost:3000. The SQLite cache is persisted in a Docker volume. Alternatively, run `cargo run --release` with Rust 1.96 or newer and FFmpeg installed on the server (with the `libwebp` encoder for WebP exports). Set `BIND_ADDRESS` (default `0.0.0.0:3000`) and `DATABASE_PATH` (default `cache.db`) as needed.
 
 ## API
 
