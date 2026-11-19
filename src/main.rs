@@ -318,6 +318,33 @@ fn find_album<'a>(data: &'a Value, artist: &str, album: &str) -> Option<&'a str>
         .map(|(_, url)| url)
 }
 
+fn web_album_candidates(html: &str, requested: &str) -> Vec<String> {
+    let pattern =
+        Regex::new(r#"https://music\.apple\.com/[a-z]{2}/album/[^/\"?]+/[0-9]+"#).unwrap();
+    let mut candidates: Vec<(u8, String)> = Vec::new();
+    for hit in pattern.find_iter(html) {
+        let link = hit.as_str();
+        let Some(slug) = link.split('/').rev().nth(1) else {
+            continue;
+        };
+        let encoded = format!("value={slug}");
+        let decoded = url::form_urlencoded::parse(encoded.as_bytes())
+            .next()
+            .map(|(_, value)| value.into_owned())
+            .unwrap_or_default();
+        let score = album_score(&decoded.replace('-', " "), requested);
+        if score != 0 && !candidates.iter().any(|(_, existing)| existing == link) {
+            candidates.push((score, link.to_owned()));
+        }
+    }
+    candidates.sort_by_key(|a| std::cmp::Reverse(a.0));
+    candidates
+        .into_iter()
+        .take(8)
+        .map(|(_, link)| link)
+        .collect()
+}
+
 async fn search(
     State(app): State<App>,
     Query(q): Query<SearchQuery>,
@@ -336,7 +363,7 @@ async fn search(
     let title = q.title.unwrap_or_default();
     let term = format!("{} {} {}", q.artist, q.album, title);
     let key = format!(
-        "search:{}",
+        "search:v3:{}",
         serde_json::to_string(&(
             normalized_name(&q.artist),
             normalized_name(&q.album),
@@ -361,6 +388,15 @@ async fn search(
             return Err(err(StatusCode::NOT_FOUND, "No album found"));
         }
     }
+    // Apple's web search can return multiple catalog editions while iTunes may only
+    // return an edition without animation. Check candidates before falling back.
+    let mut web_url = Url::parse("https://music.apple.com/us/search").unwrap();
+    web_url.query_pairs_mut().append_pair("term", &term);
+    let web = fetch(&app, web_url.as_str()).await;
+    let mut links = web
+        .as_ref()
+        .map(|html| web_album_candidates(html, &q.album))
+        .unwrap_or_default();
     let mut u = Url::parse("https://itunes.apple.com/search").unwrap();
     u.query_pairs_mut()
         .append_pair("term", &term)
@@ -373,28 +409,58 @@ async fn search(
             },
         )
         .append_pair("limit", "50");
-    let body = fetch(&app, u.as_str()).await?;
-    let data: Value = serde_json::from_str(&body)
-        .map_err(|_| err(StatusCode::BAD_GATEWAY, "Invalid search response"))?;
-    // Only an explicit results array is a confirmed miss. Upstream errors must never be cached as misses.
-    if !data.get("results").is_some_and(Value::is_array) {
-        return Err(err(StatusCode::BAD_GATEWAY, "Invalid search response"));
+    let itunes = fetch(&app, u.as_str()).await;
+    let itunes_failed = itunes.is_err();
+    match itunes {
+        Ok(body) => {
+            let data: Value = serde_json::from_str(&body)
+                .map_err(|_| err(StatusCode::BAD_GATEWAY, "Invalid search response"))?;
+            if !data.get("results").is_some_and(Value::is_array) {
+                return Err(err(StatusCode::BAD_GATEWAY, "Invalid search response"));
+            }
+            if let Some(link) = find_album(&data, &q.artist, &q.album)
+                && !links
+                    .iter()
+                    .any(|existing| target(existing) == target(link))
+            {
+                links.push(link.to_owned());
+            }
+        }
+        Err(error) if web.is_err() => return Err(error),
+        Err(_) => {}
     }
-    let Some(link) = find_album(&data, &q.artist, &q.album) else {
-        let db = app
-            .db
-            .lock()
-            .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Cache unavailable"))?;
-        db.execute(
-            "INSERT OR REPLACE INTO negative_search(key,expires) VALUES (?1,unixepoch()+86400)",
-            [&negative_key],
-        )
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Cache write failed"))?;
-        return Err(err(StatusCode::NOT_FOUND, "No album found"));
-    };
-    let a = artwork(&app, link).await?;
-    cache_put(&app, &key, &a)?;
-    result(a)
+    let mut without_artwork = None;
+    for link in links {
+        let a = artwork(&app, &link).await?;
+        if normalized_name(&a.artist) != normalized_name(&q.artist)
+            || album_score(&a.album, &q.album) == 0
+        {
+            continue;
+        }
+        if a.url.is_some() || a.url_tall.is_some() {
+            cache_put(&app, &key, &a)?;
+            return result(a);
+        }
+        without_artwork = Some(a);
+    }
+    if web.is_err() || itunes_failed {
+        return Err(err(StatusCode::BAD_GATEWAY, "Apple Music search failed"));
+    }
+    if let Some(a) = without_artwork {
+        cache_put(&app, &key, &a)?;
+        return result(a);
+    }
+    // A failed source cannot prove a search miss.
+    let db = app
+        .db
+        .lock()
+        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Cache unavailable"))?;
+    db.execute(
+        "INSERT OR REPLACE INTO negative_search(key,expires) VALUES (?1,unixepoch()+86400)",
+        [&negative_key],
+    )
+    .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Cache write failed"))?;
+    Err(err(StatusCode::NOT_FOUND, "No album found"))
 }
 
 async fn download(
@@ -620,6 +686,17 @@ mod tests {
         assert_eq!(album_score("JUMP", "JUMP - Single"), 1);
         assert_eq!(album_score("SQUARE TWO - EP", "SQUARE TWO"), 1);
         assert_eq!(album_score("JUMP (Remix) - Single", "JUMP"), 0);
+    }
+    #[test]
+    fn web_search_collects_distinct_matching_editions_in_order() {
+        let html = r#"<a href="https://music.apple.com/us/album/renaissance/1630005298">one</a><a href="https://music.apple.com/us/album/renaissance/1630005298">duplicate</a><a href="https://music.apple.com/us/album/renaissance/1636789969">two</a><a href="https://music.apple.com/us/album/renaissance-live/123">unrelated</a>"#;
+        assert_eq!(
+            web_album_candidates(html, "RENAISSANCE"),
+            vec![
+                "https://music.apple.com/us/album/renaissance/1630005298",
+                "https://music.apple.com/us/album/renaissance/1636789969"
+            ]
+        );
     }
     #[test]
     fn cache_stores_and_expires_positive_and_negative_artwork() {
