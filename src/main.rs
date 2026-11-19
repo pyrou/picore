@@ -279,9 +279,29 @@ fn album_score(found: &str, requested: &str) -> u8 {
             "single",
             "ep",
         ];
-        extra
-            .split_whitespace()
-            .all(|w| words.contains(&w) || w.chars().all(|c| c.is_ascii_digit()))
+        let parts: Vec<_> = extra.split_whitespace().collect();
+        if matches!(parts.first(), Some(&"feat" | &"featuring" | &"ft")) {
+            // Featured artist names are free text, but a different mix or version
+            // should not silently replace the requested release.
+            parts.len() > 1
+                && !parts[1..].iter().any(|word| {
+                    matches!(
+                        *word,
+                        "remix"
+                            | "remixed"
+                            | "live"
+                            | "mixed"
+                            | "karaoke"
+                            | "tribute"
+                            | "cover"
+                            | "instrumental"
+                    )
+                })
+        } else {
+            parts
+                .iter()
+                .all(|w| words.contains(w) || w.chars().all(|c| c.is_ascii_digit()))
+        }
     };
     if found
         .strip_prefix(&format!("{requested} "))
@@ -363,7 +383,7 @@ async fn search(
     let title = q.title.unwrap_or_default();
     let term = format!("{} {} {}", q.artist, q.album, title);
     let key = format!(
-        "search:v3:{}",
+        "search:v4:{}",
         serde_json::to_string(&(
             normalized_name(&q.artist),
             normalized_name(&q.album),
@@ -686,6 +706,27 @@ mod tests {
         assert_eq!(album_score("JUMP", "JUMP - Single"), 1);
         assert_eq!(album_score("SQUARE TWO - EP", "SQUARE TWO"), 1);
         assert_eq!(album_score("JUMP (Remix) - Single", "JUMP"), 0);
+    }
+    #[test]
+    fn matches_featured_artists_without_accepting_other_versions() {
+        let data = json!({"results": [{"artistName":"The Magician", "collectionName":"Never Alone (feat. Alioth) - Single", "collectionViewUrl":"https://music.apple.com/us/album/never-alone-feat-alioth-single/1746482738"}]});
+        assert_eq!(
+            find_album(&data, "The Magician", "NEVER ALONE"),
+            Some("https://music.apple.com/us/album/never-alone-feat-alioth-single/1746482738")
+        );
+        assert_eq!(
+            album_score("never-alone-feat-alioth-single", "never alone"),
+            1
+        );
+        assert_eq!(
+            album_score("Never Alone (feat. Alioth) [Remix] - Single", "never alone"),
+            0
+        );
+        assert_eq!(
+            album_score("Never Alone (feat. Alioth) Live", "never alone"),
+            0
+        );
+        assert_eq!(album_score("Never Alone Again", "never alone"), 0);
     }
     #[test]
     fn web_search_collects_distinct_matching_editions_in_order() {
