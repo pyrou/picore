@@ -611,7 +611,7 @@ async fn history(State(app): State<App>) -> Result<Json<Vec<Artwork>>, ApiError>
         .db
         .lock()
         .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Cache unavailable"))?;
-    let mut stmt = db.prepare("SELECT value FROM cache WHERE key NOT LIKE 'search:%' AND expires > unixepoch() ORDER BY updated DESC LIMIT 30").map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR,"Cache read failed"))?;
+    let mut stmt = db.prepare("SELECT value FROM cache WHERE key NOT LIKE 'search:%' AND expires > unixepoch() AND (json_extract(value, '$.url') IS NOT NULL OR json_extract(value, '$.url_tall') IS NOT NULL) ORDER BY updated DESC LIMIT 50").map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR,"Cache read failed"))?;
     let rows = stmt
         .query_map([], |r| r.get::<_, String>(0))
         .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Cache read failed"))?;
