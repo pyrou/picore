@@ -606,20 +606,6 @@ async fn download(
         .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Conversion failed"))
 }
 
-async fn history(State(app): State<App>) -> Result<Json<Vec<Artwork>>, ApiError> {
-    let db = app
-        .db
-        .lock()
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Cache unavailable"))?;
-    let mut stmt = db.prepare("SELECT value FROM cache WHERE key NOT LIKE 'search:%' AND expires > unixepoch() AND (json_extract(value, '$.url') IS NOT NULL OR json_extract(value, '$.url_tall') IS NOT NULL) ORDER BY updated DESC LIMIT 50").map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR,"Cache read failed"))?;
-    let rows = stmt
-        .query_map([], |r| r.get::<_, String>(0))
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Cache read failed"))?;
-    Ok(Json(
-        rows.filter_map(|r| r.ok().and_then(|s| serde_json::from_str(&s).ok()))
-            .collect(),
-    ))
-}
 #[tokio::main]
 async fn main() {
     let path = env::var("DATABASE_PATH").unwrap_or_else(|_| "cache.db".into());
@@ -635,11 +621,10 @@ async fn main() {
     let router = Router::new()
         .route(
             "/",
-            get(|| async { Html(include_str!("../static/index.html")) }),
+            get(|| async { Html(include_str!(concat!(env!("OUT_DIR"), "/index.html"))) }),
         )
         .route("/api/v1/artwork/url", get(by_url))
         .route("/api/v1/artwork/search", get(search))
-        .route("/api/v1/artwork/history", get(history))
         .route("/api/v1/artwork/download", get(download))
         .route(
             "/api/v1/status",

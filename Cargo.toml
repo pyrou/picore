@@ -12,3 +12,6 @@ serde_json = "1"
 regex = "1"
 rusqlite = { version = "0.37", features = ["bundled"] }
 url = "2"
+
+[build-dependencies]
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
