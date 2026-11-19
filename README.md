@@ -1,4 +1,4 @@
-# Picore
+# 🐤 Picore
 
 Look up animated album and playlist artwork on Apple Music and export it as MP4 or WebP. No user account is required.
 
