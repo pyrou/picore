@@ -2,9 +2,10 @@
 
 Look up animated album and playlist artwork on Apple Music and export it as MP4 or WebP. No user account is required.
 
-## Run
+## Setup
 
 ```sh
+git clone https://github.com/pyrou/picore.git && cd picore
 docker compose up -d --build
 ```
 
@@ -18,5 +19,3 @@ Open `http://localhost:3000`. The SQLite cache is persisted in a Docker volume. 
 - `GET /api/v1/status`
 
 Artwork responses include `url` (square), `url_tall`, `artist`, `album`, and `isCached`. URLs are HLS playlists; playback requires an HLS-capable player. Search checks Apple Music and iTunes catalog results, matching artist and album names and preferring exact albums over editions with suffixes. It checks matching releases for animated artwork. Successful results are cached for seven days; albums without animation and confirmed search misses are cached for one day. Apple Music's public web catalog is an unofficial upstream and can change or rate-limit requests.
-
-Downloads convert a previously looked-up stream on the server (up to 60 seconds, 64 MiB and two concurrent conversions).
